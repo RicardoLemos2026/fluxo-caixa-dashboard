@@ -25,7 +25,7 @@ jobs:
 
       - name: Gerar dashboard atualizado
         env:
-          ONEDRIVE_SHARE_URL: ${{ secrets.ONEDRIVE_SHARE_URL }}
+          ONEDRIVE_SHARE_URL: "https://1drv.ms/x/c/dd209acb38806d15/IQB-ob8nzeneSIcyxDyrVkt5AfZ46m2WcoL7-bQztX8_BeI?e=5Sh6tO"
         run: python scripts/update_dashboard.py
 
       - name: Publicar mudanças (se houver)
