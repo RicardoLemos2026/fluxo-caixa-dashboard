@@ -2,21 +2,6 @@
 """
 Atualiza o dashboard de Fluxo de Caixa (Business Connection) a partir da
 planilha Excel hospedada no OneDrive, sem qualquer intervenção manual.
-
-Fluxo:
-  1. Baixa a planilha via a API pública de compartilhamento do OneDrive
-     (funciona sem login, desde que o link esteja configurado como
-     "Qualquer pessoa com o link pode ver/baixar").
-  2. Lê a aba "Fluxo de Caixa" (saldo por conta + fluxo diário previsto/realizado).
-  3. Cruza com "Contas a Pagar" e "Contas a Receber" para montar a agenda dos
-     próximos 15 dias e a narrativa do ponto mais baixo do mês.
-  4. Regenera o arquivo index.html (mesmo layout/estilo do dashboard original),
-     com Chart.js embutido — funciona offline, sem CDN.
-
-Variáveis de ambiente esperadas:
-  ONEDRIVE_SHARE_URL   -> link de compartilhamento da planilha no OneDrive
-  DASHBOARD_TODAY      -> (opcional) força a data de "hoje" no formato YYYY-MM-DD,
-                           útil para testes locais. Se ausente, usa a data atual.
 """
 import base64
 import datetime as dt
@@ -43,39 +28,47 @@ COLORS = {
 }
 
 
-# --------------------------------------------------------------------------
-# 1. Download da planilha (API anônima de compartilhamento do OneDrive)
-# --------------------------------------------------------------------------
-def onedrive_share_to_download_url(share_url: str) -> str:
+def _share_token(share_url: str) -> str:
     b64 = base64.urlsafe_b64encode(share_url.encode("utf-8")).decode("utf-8").rstrip("=")
-    token = "u!" + b64
-    return f"https://api.onedrive.com/v1.0/shares/{token}/root/content"
+    return "u!" + b64
+
+
+def _candidate_urls(share_url: str):
+    token = _share_token(share_url)
+    return [
+        f"https://graph.microsoft.com/v1.0/shares/{token}/driveItem/content",
+        f"https://api.onedrive.com/v1.0/shares/{token}/root/content",
+    ]
 
 
 def download_spreadsheet(share_url: str, dest_path: str) -> None:
-    api_url = onedrive_share_to_download_url(share_url)
-    req = urllib.request.Request(api_url, headers={"User-Agent": "dashboard-updater/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp, open(dest_path, "wb") as f:
-            f.write(resp.read())
-    except urllib.error.HTTPError as e:
-        raise SystemExit(
-            "Falha ao baixar a planilha do OneDrive "
-            f"(HTTP {e.code}). O link de compartilhamento precisa estar "
-            "configurado como 'Qualquer pessoa com o link' com permissão de "
-            "visualização/download. Verifique ONEDRIVE_SHARE_URL."
-        ) from e
+    last_error = None
+    for api_url in _candidate_urls(share_url):
+        req = urllib.request.Request(api_url, headers={"User-Agent": "dashboard-updater/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp, open(dest_path, "wb") as f:
+                f.write(resp.read())
+            return
+        except urllib.error.HTTPError as e:
+            last_error = e
+            print(f"  tentativa via {api_url.split('/')[2]} falhou: HTTP {e.code}")
+            continue
+    raise SystemExit(
+        "Falha ao baixar a planilha do OneDrive "
+        f"(HTTP {last_error.code if last_error else '??'}). O link de "
+        "compartilhamento precisa estar configurado como 'Qualquer pessoa "
+        "com o link' com permissão de visualização/download. Verifique "
+        "ONEDRIVE_SHARE_URL. Se o erro persistir em ambos os endpoints, a "
+        "conta pode estar bloqueando acesso anônimo programático — nesse "
+        "caso é necessário usar autenticação via Microsoft Graph (Azure AD)."
+    ) from last_error
 
 
-# --------------------------------------------------------------------------
-# 2. Extração dos dados
-# --------------------------------------------------------------------------
 def load_workbook(path):
     return openpyxl.load_workbook(path, data_only=True)
 
 
 def parse_fluxo_de_caixa(ws, today: dt.date):
-    """Retorna (accounts, daily_rows, today_row) a partir da aba 'Fluxo de Caixa'."""
     accounts_raw = {
         "Mercury": ws.cell(row=6, column=4).value,
         "Inter": ws.cell(row=6, column=5).value,
@@ -90,8 +83,8 @@ def parse_fluxo_de_caixa(ws, today: dt.date):
     accounts.sort(key=lambda a: a["value"], reverse=True)
 
     daily_rows = []
-    for r in range(11, 195):  # linhas de dados diários (antes de "Saldo do Mês")
-        date_val = ws.cell(row=r, column=2).value  # Data (Previsto) — coluna limpa
+    for r in range(11, 195):
+        date_val = ws.cell(row=r, column=2).value
         if not isinstance(date_val, dt.datetime):
             continue
         daily_rows.append(
@@ -108,7 +101,6 @@ def parse_fluxo_de_caixa(ws, today: dt.date):
 
     today_row = next((row for row in daily_rows if row["date"] == today), None)
     if today_row is None:
-        # fallback: usa o último dia com dado realizado <= hoje
         past = [row for row in daily_rows if row["date"] <= today]
         today_row = past[-1] if past else daily_rows[0]
 
@@ -148,9 +140,6 @@ def parse_contas_a_receber(ws):
     return rows
 
 
-# --------------------------------------------------------------------------
-# 3. Cálculo dos KPIs / narrativa
-# --------------------------------------------------------------------------
 def end_of_month(d: dt.date) -> dt.date:
     if d.month == 12:
         return d.replace(day=31)
@@ -171,7 +160,6 @@ def find_row(daily_rows, target_date):
     for row in daily_rows:
         if row["date"] == target_date:
             return row
-    # se a data cair fora da faixa coberta pela planilha, usa a mais próxima anterior
     prior = [row for row in daily_rows if row["date"] <= target_date]
     return prior[-1] if prior else None
 
@@ -197,7 +185,6 @@ def build_dashboard_data(daily_rows, today_row, accounts, pagar_rows, receber_ro
     entradas_periodo = sum(r["entrada_p"] for r in proj)
     saidas_periodo = sum(r["saida_p"] for r in proj)
 
-    # narrativa do ponto mais baixo: maior categoria de despesa naquele dia
     pagamentos_no_dia = [p for p in pagar_rows if p["date"] == low_point["date"]]
     top_categoria = None
     if pagamentos_no_dia:
@@ -237,9 +224,6 @@ def build_dashboard_data(daily_rows, today_row, accounts, pagar_rows, receber_ro
     }
 
 
-# --------------------------------------------------------------------------
-# 4. Geração do HTML
-# --------------------------------------------------------------------------
 def fmt_money(v):
     v = round(float(v or 0), 2)
     neg = v < 0
@@ -382,10 +366,6 @@ def build_html(data: dict) -> str:
 
     chartjs_lib = open(CHARTJS_PATH, encoding="utf-8").read()
 
-    labels = [fmt_ddmm(today)] + [fmt_ddmm(p["date"]) for p in proj]
-    entrada_data = [None] + [round(p["entrada_p"], 2) for p in proj]
-    saida_data = [None] + [round(-p["saida_p"], 2) for p in proj]
-    saldo_data = [round(today_saldo, 2)] + [round(p["saldo_p"], 2) for p in proj]
     proj_json = json.dumps(
         [
             {
@@ -629,9 +609,6 @@ td.neg-cell{{color:var(--red);}} td.pos-cell{{color:var(--green);}}
 """
 
 
-# --------------------------------------------------------------------------
-# main
-# --------------------------------------------------------------------------
 def main():
     share_url = os.environ.get("ONEDRIVE_SHARE_URL")
     if not share_url:
@@ -643,7 +620,7 @@ def main():
     else:
         today = dt.date.today()
 
-    print(f"Baixando planilha do OneDrive...")
+    print("Baixando planilha do OneDrive...")
     download_spreadsheet(share_url, XLSX_PATH)
 
     print("Lendo planilha...")
